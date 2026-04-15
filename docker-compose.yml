@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  gate-detector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gate-detector
+    restart: unless-stopped
+    
+    # Variáveis de ambiente
+    environment:
+      # Configurações da DVR
+      DVR_HOST: 192.168.0.21
+      DVR_PORT: 80
+      DVR_USER: manus
+      DVR_PASS: Teste123
+      CAMERA_INDEX: 2
+      
+      # Configurações da API de abertura do portão
+      GATE_API_URL: http://api-v2.pemill.com.br/open/dor/2
+      
+      # Tempo mínimo entre aberturas (em segundos)
+      GATE_COOLDOWN_SECONDS: 60
+      
+      # Confiança mínima para detecção (0.0 a 1.0)
+      CONFIDENCE_THRESHOLD: 0.5
+    
+    # Volumes para persistência de logs
+    volumes:
+      - ./logs:/app/logs
+    
+    # Recursos de CPU e memória
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    
+    # Healthcheck
+    healthcheck:
+      test: ["CMD", "test", "-f", "/app/logs/gate_detector.log"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    # Logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
