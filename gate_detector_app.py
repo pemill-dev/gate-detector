@@ -10,12 +10,27 @@ import json
 import requests
 import cv2
 import numpy as np
+import os
+import warnings
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Tuple
-from ultralytics import YOLO
 from threading import Thread, Lock
 import traceback
+
+# Suprimir avisos do PyTorch/NNPACK ANTES de importar YOLO
+os.environ['TORCH_WARN_ONCE'] = '0'
+os.environ['PYTHONWARNINGS'] = 'ignore'
+warnings.filterwarnings('ignore')
+
+# Suprimir logs de debug do PyTorch
+logging.getLogger('torch').setLevel(logging.ERROR)
+logging.getLogger('torchvision').setLevel(logging.ERROR)
+logging.getLogger('urllib3').setLevel(logging.ERROR)
+
+# Importar YOLO após suprimir avisos
+from ultralytics import YOLO
 
 # Configuração de logging
 logging.basicConfig(
@@ -27,6 +42,9 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Suprimir avisos de bibliotecas externas
+logging.getLogger('onvif').setLevel(logging.ERROR)
 
 # Criar diretório de logs se não existir
 Path('/app/logs').mkdir(parents=True, exist_ok=True)
@@ -176,7 +194,10 @@ class GateDetectionSystem:
         try:
             logger.info("Carregando modelo YOLOv8...")
             # Usar modelo nano para melhor performance
-            self.model = YOLO('yolov8n.pt')
+            # Suprimir avisos do PyTorch durante carregamento
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                self.model = YOLO('yolov8n.pt')
             logger.info("Modelo YOLOv8 carregado com sucesso")
             return True
         except Exception as e:
@@ -184,7 +205,7 @@ class GateDetectionSystem:
             logger.debug(traceback.format_exc())
             return False
     
-    def detect_cars_in_frame(self, frame: np.ndarray) -> Tuple[bool, list]:
+    def detect_cars_in_frame(self, frame: np.ndarray) -> tuple:
         """
         Detecta carros em um frame usando YOLOv8
         
@@ -301,8 +322,6 @@ class GateDetectionSystem:
             
             if has_car:
                 logger.debug(f"Carros detectados: {len(detections)}")
-                for det in detections:
-                    logger.debug(f"  - {det['class']}: {det['confidence']:.2%}")
             
             # Verificar e abrir portão se necessário
             self.check_and_open_gate(has_car)
@@ -313,50 +332,43 @@ class GateDetectionSystem:
     
     def run(self) -> None:
         """
-        Loop principal do sistema
+        Loop principal do sistema de detecção
         """
-        logger.info("Iniciando sistema de detecção...")
-        self.is_running = True
-        
         try:
-            # Inicializar stream e modelo
+            logger.info("Iniciando sistema de detecção...")
+            
+            # Inicializar stream
             if not self.initialize_stream():
                 logger.error("Falha ao inicializar stream")
                 return
             
+            # Inicializar modelo
             if not self.initialize_model():
-                logger.error("Falha ao carregar modelo")
+                logger.error("Falha ao inicializar modelo")
+                self.cleanup()
                 return
             
+            self.is_running = True
             logger.info("Sistema pronto. Monitorando câmera...")
             
+            # Loop de processamento
             frame_count = 0
-            start_time = time.time()
-            
             while self.is_running:
                 try:
-                    # Capturar frame
                     ret, frame = self.cap.read()
                     
                     if not ret:
-                        logger.warning("Falha ao capturar frame. Reconectando...")
-                        self.cap.release()
-                        time.sleep(2)
+                        logger.warning("Falha ao ler frame do stream")
+                        # Tentar reconectar
                         if not self.initialize_stream():
-                            logger.error("Falha ao reconectar")
+                            logger.error("Falha ao reconectar ao stream")
                             break
                         continue
                     
-                    # Processar frame
-                    self.process_frame(frame)
-                    
+                    # Processar frame a cada N frames para melhor performance
                     frame_count += 1
-                    
-                    # Log de performance a cada 100 frames
-                    if frame_count % 100 == 0:
-                        elapsed = time.time() - start_time
-                        fps = frame_count / elapsed
-                        logger.debug(f"Performance: {fps:.1f} FPS, Frames processados: {frame_count}")
+                    if frame_count % 5 == 0:  # Processar a cada 5 frames
+                        self.process_frame(frame)
                     
                 except KeyboardInterrupt:
                     logger.info("Interrupção do usuário")
@@ -365,6 +377,10 @@ class GateDetectionSystem:
                     logger.error(f"Erro no loop principal: {e}")
                     logger.debug(traceback.format_exc())
                     time.sleep(1)
+        
+        except Exception as e:
+            logger.error(f"Erro fatal: {e}")
+            logger.debug(traceback.format_exc())
         
         finally:
             self.cleanup()
@@ -380,31 +396,20 @@ class GateDetectionSystem:
             self.cap.release()
         
         logger.info("Sistema encerrado")
-    
-    def stop(self) -> None:
-        """
-        Para o sistema
-        """
-        logger.info("Parando sistema...")
-        self.is_running = False
 
 
 def main():
     """Função principal"""
     import os
     
-    # Configurações da DVR
+    # Obter configurações das variáveis de ambiente
     dvr_host = os.getenv('DVR_HOST', '192.168.0.21')
     dvr_port = int(os.getenv('DVR_PORT', '80'))
     dvr_user = os.getenv('DVR_USER', 'manus')
     dvr_pass = os.getenv('DVR_PASS', 'Teste123')
     camera_index = int(os.getenv('CAMERA_INDEX', '2'))
-    
-    # Configurações da API de abertura
     gate_api_url = os.getenv('GATE_API_URL', 'http://api-v2.pemill.com.br/open/dor/2')
-    gate_cooldown = int(os.getenv('GATE_COOLDOWN_SECONDS', '60'))
-    
-    # Configurações de detecção
+    gate_cooldown_seconds = int(os.getenv('GATE_COOLDOWN_SECONDS', '60'))
     confidence_threshold = float(os.getenv('CONFIDENCE_THRESHOLD', '0.5'))
     
     # Criar e executar sistema
@@ -415,15 +420,11 @@ def main():
         dvr_pass=dvr_pass,
         camera_index=camera_index,
         gate_api_url=gate_api_url,
-        gate_cooldown_seconds=gate_cooldown,
+        gate_cooldown_seconds=gate_cooldown_seconds,
         confidence_threshold=confidence_threshold
     )
     
-    try:
-        system.run()
-    except KeyboardInterrupt:
-        logger.info("Encerrando...")
-        system.stop()
+    system.run()
 
 
 if __name__ == '__main__':
