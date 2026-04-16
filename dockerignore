@@ -1,20 +1,47 @@
-.git
-.gitignore
+# Variáveis de ambiente com informações sensíveis
 .env
-.env.example
-README.md
-TROUBLESHOOTING.md
-CAMERA_ANALYSIS.md
-*.md
-.DS_Store
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.Python
-env/
-venv/
-.vscode
-.idea
-*.log
+.env.local
+.env.*.local
+
+# Logs
 logs/
+*.log
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# Modelos YOLOv8 (podem ser grandes)
+*.pt

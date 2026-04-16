@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Sistema de Detecção de Carros e Abertura Automática de Portão
-Monitora câmera DVR Intelbras via ONVIF e detecta carros com YOLOv8
+Monitora câmera DVR via ONVIF e detecta carros com YOLOv8
+Aguarda veículo parado por tempo configurável antes de abrir portão
 """
 
 import logging
@@ -17,7 +18,7 @@ import base64
 from io import BytesIO
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from threading import Thread, Lock
 import traceback
 
@@ -66,7 +67,9 @@ class GateDetectionSystem:
         gate_cooldown_seconds: int = 60,
         confidence_threshold: float = 0.5,
         car_classes: list = None,
-        rocket_chat_webhook: str = None
+        rocket_chat_webhook: str = None,
+        car_stationary_seconds: int = 3,
+        roi_exclude: Tuple[int, int, int, int] = None
     ):
         """
         Inicializa o sistema de detecção
@@ -81,6 +84,8 @@ class GateDetectionSystem:
             gate_cooldown_seconds: Tempo mínimo entre aberturas
             confidence_threshold: Confiança mínima para detecção
             car_classes: Classes de objetos a detectar (ex: ['car', 'truck'])
+            rocket_chat_webhook: URL do webhook do Rocket.Chat
+            car_stationary_seconds: Tempo que o carro deve ficar parado (segundos)
         """
         self.dvr_host = dvr_host
         self.dvr_port = dvr_port
@@ -92,6 +97,8 @@ class GateDetectionSystem:
         self.confidence_threshold = confidence_threshold
         self.car_classes = car_classes or ['car', 'truck', 'bus', 'motorcycle']
         self.rocket_chat_webhook = rocket_chat_webhook
+        self.car_stationary_seconds = car_stationary_seconds
+        self.roi_exclude = roi_exclude  # (x1, y1, x2, y2) para excluir detecções
         
         # Estado do sistema
         self.lock = Lock()
@@ -103,7 +110,12 @@ class GateDetectionSystem:
         self.model = None
         self.last_frame = None
         
-        logger.info(f"Sistema inicializado: DVR={dvr_host}:{dvr_port}, Câmera={camera_index}")
+        # Rastreamento de veículos parados
+        self.car_detection_start_time = None
+        self.last_car_position = None
+        self.position_stability_count = 0
+        
+        logger.info(f"Sistema inicializado: DVR={dvr_host}:{dvr_port}, Câmera={camera_index}, Tempo parado={car_stationary_seconds}s")
     
     def get_stream_url_from_onvif(self) -> Optional[str]:
         """
@@ -133,7 +145,6 @@ class GateDetectionSystem:
                 return None
             
             # Usar o perfil correspondente à câmera
-            # Nota: Pode ser necessário ajustar a lógica conforme a DVR
             profile = profiles[self.camera_index - 1] if len(profiles) >= self.camera_index else profiles[0]
             
             # Obter URL de stream
@@ -210,7 +221,7 @@ class GateDetectionSystem:
             logger.debug(traceback.format_exc())
             return False
     
-    def detect_cars_in_frame(self, frame: np.ndarray) -> tuple:
+    def detect_cars_in_frame(self, frame: np.ndarray) -> Tuple[bool, List]:
         """
         Detecta carros em um frame usando YOLOv8
         
@@ -240,6 +251,11 @@ class GateDetectionSystem:
                         
                         # Verificar se é um veículo de interesse
                         if class_name.lower() in self.car_classes:
+                            # Verificar se está na ROI de exclusão
+                            if self._is_in_excluded_roi(box.xyxy[0].tolist()):
+                                logger.debug(f"Detecção ignorada - está na área de exclusão")
+                                continue
+                            
                             has_car = True
                             detections.append({
                                 'class': class_name,
@@ -344,34 +360,145 @@ class GateDetectionSystem:
             logger.debug(traceback.format_exc())
             return False
     
-    def check_and_open_gate(self, has_car: bool) -> None:
+    def _calculate_detection_center(self, detections: List) -> Tuple[float, float]:
         """
-        Verifica se deve abrir o portão baseado na detecção de carro
+        Calcula o centro da detecção (média das caixas)
+        
+        Args:
+            detections: Lista de detecções
+            
+        Returns:
+            Tupla (x_center, y_center)
+        """
+        if not detections:
+            return (0, 0)
+        
+        total_x = 0
+        total_y = 0
+        
+        for detection in detections:
+            box = detection['box']  # [x1, y1, x2, y2]
+            x_center = (box[0] + box[2]) / 2
+            y_center = (box[1] + box[3]) / 2
+            total_x += x_center
+            total_y += y_center
+        
+        avg_x = total_x / len(detections)
+        avg_y = total_y / len(detections)
+        
+        return (avg_x, avg_y)
+    
+    def _is_position_stable(self, last_pos: Tuple[float, float], current_pos: Tuple[float, float], threshold: float = 50.0) -> bool:
+        """
+        Verifica se a posição do carro é estável (não se moveu muito)
+        
+        Args:
+            last_pos: Posição anterior
+            current_pos: Posição atual
+            threshold: Distância máxima em pixels para considerar estável
+            
+        Returns:
+            True se posição é estável, False caso contrário
+        """
+        if last_pos is None:
+            return True
+        
+        # Calcular distância euclidiana
+        distance = np.sqrt((current_pos[0] - last_pos[0])**2 + (current_pos[1] - last_pos[1])**2)
+        
+        return distance < threshold
+    
+    def _is_in_excluded_roi(self, box: List[float]) -> bool:
+        """
+        Verifica se a deteccao esta na area de exclusao (ROI)
+        
+        Args:
+            box: Caixa de deteccao [x1, y1, x2, y2]
+            
+        Returns:
+            True se esta na area de exclusao, False caso contrario
+        """
+        if self.roi_exclude is None:
+            return False
+        
+        # Extrair coordenadas da caixa
+        x1, y1, x2, y2 = box
+        roi_x1, roi_y1, roi_x2, roi_y2 = self.roi_exclude
+        
+        # Verificar se a caixa se sobrepoe com a ROI de exclusao
+        # Se houver sobreposicao, retorna True (deve ser excluida)
+        if x1 < roi_x2 and x2 > roi_x1 and y1 < roi_y2 and y2 > roi_y1:
+            return True
+        
+        return False
+    
+    def check_and_open_gate(self, has_car: bool, detections: List = None) -> None:
+        """
+        Verifica se deve abrir o portão baseado na detecção de carro parado
         
         Args:
             has_car: Se foi detectado um carro
+            detections: Lista de detecções com posições dos carros
         """
         with self.lock:
             current_time = datetime.now()
             
-            # Se detectou carro e portão está fechado
-            if has_car and not self.is_gate_open:
-                # Verificar se passou o tempo de cooldown
-                if self.gate_last_opened is None or \
-                   (current_time - self.gate_last_opened).total_seconds() >= self.gate_cooldown_seconds:
+            # Se detectou carro
+            if has_car and detections:
+                # Calcular posição média dos carros detectados
+                current_position = self._calculate_detection_center(detections)
+                
+                # Se é a primeira detecção de carro
+                if self.car_detection_start_time is None:
+                    self.car_detection_start_time = current_time
+                    self.last_car_position = current_position
+                    self.position_stability_count = 0
+                    logger.debug("Carro detectado - iniciando contagem de tempo")
+                
+                # Se carro mantém posição similar (parado)
+                elif self._is_position_stable(self.last_car_position, current_position):
+                    self.position_stability_count += 1
+                    elapsed_time = (current_time - self.car_detection_start_time).total_seconds()
                     
-                    # Enviar requisição para abrir
-                    if self.send_gate_open_request():
-                        self.is_gate_open = True
-                        self.gate_last_opened = current_time
-                        logger.info(f"Portão aberto. Próxima abertura permitida em {self.gate_cooldown_seconds}s")
-                        
-                        # Enviar notificação para Rocket.Chat com screenshot
-                        if self.last_frame is not None:
-                            self.send_rocket_chat_notification(self.last_frame)
+                    # Se carro ficou parado por tempo suficiente
+                    if elapsed_time >= self.car_stationary_seconds and not self.is_gate_open:
+                        # Verificar se passou o tempo de cooldown
+                        if self.gate_last_opened is None or \
+                           (current_time - self.gate_last_opened).total_seconds() >= self.gate_cooldown_seconds:
+                            
+                            logger.info(f"Carro parado por {elapsed_time:.1f}s - Abrindo portão")
+                            
+                            # Enviar requisição para abrir
+                            if self.send_gate_open_request():
+                                self.is_gate_open = True
+                                self.gate_last_opened = current_time
+                                logger.info(f"Portão aberto. Próxima abertura permitida em {self.gate_cooldown_seconds}s")
+                                
+                                # Enviar notificação para Rocket.Chat com screenshot
+                                if self.last_frame is not None:
+                                    self.send_rocket_chat_notification(self.last_frame)
+                                
+                                # Resetar rastreamento
+                                self.car_detection_start_time = None
+                                self.last_car_position = None
+                                self.position_stability_count = 0
+                else:
+                    # Posição mudou - resetar contagem
+                    self.last_car_position = current_position
+                    self.position_stability_count = 0
+                    logger.debug("Carro em movimento - resetando contagem")
+            
+            # Se não detectou carro
+            else:
+                # Resetar rastreamento
+                if self.car_detection_start_time is not None:
+                    logger.debug("Carro desapareceu - resetando rastreamento")
+                    self.car_detection_start_time = None
+                    self.last_car_position = None
+                    self.position_stability_count = 0
             
             # Se portão está aberto e passou o tempo de cooldown
-            elif self.is_gate_open and self.gate_last_opened:
+            if self.is_gate_open and self.gate_last_opened:
                 if (current_time - self.gate_last_opened).total_seconds() >= self.gate_cooldown_seconds:
                     self.is_gate_open = False
                     logger.info("Portão marcado como fechado")
@@ -393,8 +520,8 @@ class GateDetectionSystem:
             if has_car:
                 logger.debug(f"Carros detectados: {len(detections)}")
             
-            # Verificar e abrir portão se necessário
-            self.check_and_open_gate(has_car)
+            # Verificar e abrir portão se necessário (com detecção de parada)
+            self.check_and_open_gate(has_car, detections)
             
         except Exception as e:
             logger.error(f"Erro ao processar frame: {e}")
@@ -477,11 +604,23 @@ def main():
     dvr_port = int(os.getenv('DVR_PORT'))
     dvr_user = os.getenv('DVR_USER')
     dvr_pass = os.getenv('DVR_PASS')
-    camera_index = int(os.getenv('CAMERA_INDEX'))
+    camera_index = int(os.getenv('CAMERA_INDEX', '2'))
     gate_api_url = os.getenv('GATE_API_URL')
     gate_cooldown_seconds = int(os.getenv('GATE_COOLDOWN_SECONDS', '60'))
     confidence_threshold = float(os.getenv('CONFIDENCE_THRESHOLD', '0.5'))
-    rocket_chat_webhook = os.getenv('ROCKET_CHAT_WEBHOOK')
+    rocket_chat_webhook = os.getenv('ROCKET_CHAT_WEBHOOK', None)
+    car_stationary_seconds = int(os.getenv('CAR_STATIONARY_SECONDS', '3'))
+    
+    # Configurar ROI de exclusao (area do estacionamento, por exemplo)
+    roi_exclude = None
+    roi_x1 = os.getenv('ROI_EXCLUDE_X1', None)
+    roi_y1 = os.getenv('ROI_EXCLUDE_Y1', None)
+    roi_x2 = os.getenv('ROI_EXCLUDE_X2', None)
+    roi_y2 = os.getenv('ROI_EXCLUDE_Y2', None)
+    
+    if all([roi_x1, roi_y1, roi_x2, roi_y2]):
+        roi_exclude = (int(roi_x1), int(roi_y1), int(roi_x2), int(roi_y2))
+        logger.info(f"ROI de exclusao configurada: {roi_exclude}")
     
     # Criar e executar sistema
     system = GateDetectionSystem(
@@ -493,7 +632,9 @@ def main():
         gate_api_url=gate_api_url,
         gate_cooldown_seconds=gate_cooldown_seconds,
         confidence_threshold=confidence_threshold,
-        rocket_chat_webhook=rocket_chat_webhook
+        rocket_chat_webhook=rocket_chat_webhook,
+        car_stationary_seconds=car_stationary_seconds,
+        roi_exclude=roi_exclude
     )
     
     system.run()
