@@ -13,6 +13,8 @@ import numpy as np
 import os
 import warnings
 import sys
+import base64
+from io import BytesIO
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Tuple
@@ -63,7 +65,8 @@ class GateDetectionSystem:
         gate_api_url: str,
         gate_cooldown_seconds: int = 60,
         confidence_threshold: float = 0.5,
-        car_classes: list = None
+        car_classes: list = None,
+        rocket_chat_webhook: str = None
     ):
         """
         Inicializa o sistema de detecção
@@ -88,6 +91,7 @@ class GateDetectionSystem:
         self.gate_cooldown_seconds = gate_cooldown_seconds
         self.confidence_threshold = confidence_threshold
         self.car_classes = car_classes or ['car', 'truck', 'bus', 'motorcycle']
+        self.rocket_chat_webhook = rocket_chat_webhook
         
         # Estado do sistema
         self.lock = Lock()
@@ -97,6 +101,7 @@ class GateDetectionSystem:
         self.stream_url = None
         self.cap = None
         self.model = None
+        self.last_frame = None
         
         logger.info(f"Sistema inicializado: DVR={dvr_host}:{dvr_port}, Câmera={camera_index}")
     
@@ -281,6 +286,64 @@ class GateDetectionSystem:
             logger.debug(traceback.format_exc())
             return False
     
+    def send_rocket_chat_notification(self, frame: np.ndarray) -> bool:
+        """
+        Envia notificação com screenshot para Rocket.Chat
+        
+        Args:
+            frame: Frame de vídeo para capturar
+            
+        Returns:
+            True se bem-sucedido, False caso contrário
+        """
+        if not self.rocket_chat_webhook:
+            return False
+        
+        try:
+            # Codificar frame em PNG
+            success, buffer = cv2.imencode('.png', frame)
+            if not success:
+                logger.error("Falha ao codificar frame em PNG")
+                return False
+            
+            # Converter para Base64
+            img_base64 = base64.b64encode(buffer).decode('utf-8')
+            
+            # Criar payload para Rocket.Chat
+            timestamp = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+            payload = {
+                "text": f"🚗 Portão Aberto - {timestamp}",
+                "attachments": [
+                    {
+                        "text": "Captura da câmera no momento da detecção",
+                        "image_url": f"data:image/png;base64,{img_base64}",
+                        "color": "#764FA5"
+                    }
+                ]
+            }
+            
+            # Enviar para Rocket.Chat
+            response = requests.post(
+                self.rocket_chat_webhook,
+                json=payload,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                logger.info("Notificação enviada para Rocket.Chat com sucesso")
+                return True
+            else:
+                logger.warning(f"Falha ao enviar para Rocket.Chat: {response.status_code}")
+                return False
+                
+        except requests.exceptions.Timeout:
+            logger.error("Timeout ao enviar notificação para Rocket.Chat")
+            return False
+        except Exception as e:
+            logger.error(f"Erro ao enviar notificação para Rocket.Chat: {e}")
+            logger.debug(traceback.format_exc())
+            return False
+    
     def check_and_open_gate(self, has_car: bool) -> None:
         """
         Verifica se deve abrir o portão baseado na detecção de carro
@@ -302,6 +365,10 @@ class GateDetectionSystem:
                         self.is_gate_open = True
                         self.gate_last_opened = current_time
                         logger.info(f"Portão aberto. Próxima abertura permitida em {self.gate_cooldown_seconds}s")
+                        
+                        # Enviar notificação para Rocket.Chat com screenshot
+                        if self.last_frame is not None:
+                            self.send_rocket_chat_notification(self.last_frame)
             
             # Se portão está aberto e passou o tempo de cooldown
             elif self.is_gate_open and self.gate_last_opened:
@@ -317,6 +384,9 @@ class GateDetectionSystem:
             frame: Frame de vídeo
         """
         try:
+            # Armazenar frame atual para possível envio ao Rocket.Chat
+            self.last_frame = frame.copy()
+            
             # Detectar carros
             has_car, detections = self.detect_cars_in_frame(frame)
             
@@ -403,14 +473,15 @@ def main():
     import os
     
     # Obter configurações das variáveis de ambiente
-    dvr_host = os.getenv('DVR_HOST', '192.168.0.21')
-    dvr_port = int(os.getenv('DVR_PORT', '80'))
-    dvr_user = os.getenv('DVR_USER', 'manus')
-    dvr_pass = os.getenv('DVR_PASS', 'Teste123')
-    camera_index = int(os.getenv('CAMERA_INDEX', '2'))
-    gate_api_url = os.getenv('GATE_API_URL', 'http://api-v2.pemill.com.br/open/dor/2')
+    dvr_host = os.getenv('DVR_HOST')
+    dvr_port = int(os.getenv('DVR_PORT'))
+    dvr_user = os.getenv('DVR_USER')
+    dvr_pass = os.getenv('DVR_PASS')
+    camera_index = int(os.getenv('CAMERA_INDEX'))
+    gate_api_url = os.getenv('GATE_API_URL')
     gate_cooldown_seconds = int(os.getenv('GATE_COOLDOWN_SECONDS', '60'))
     confidence_threshold = float(os.getenv('CONFIDENCE_THRESHOLD', '0.5'))
+    rocket_chat_webhook = os.getenv('ROCKET_CHAT_WEBHOOK')
     
     # Criar e executar sistema
     system = GateDetectionSystem(
@@ -421,7 +492,8 @@ def main():
         camera_index=camera_index,
         gate_api_url=gate_api_url,
         gate_cooldown_seconds=gate_cooldown_seconds,
-        confidence_threshold=confidence_threshold
+        confidence_threshold=confidence_threshold,
+        rocket_chat_webhook=rocket_chat_webhook
     )
     
     system.run()
