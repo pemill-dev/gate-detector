@@ -128,10 +128,10 @@ class GateDetectionSystem:
     def get_stream_url_fallback(self) -> str:
         """
         URL de fallback caso ONVIF falhe
-        Tenta construir URL RTSP padrão para Intelbras
+        Usa URL RTSP correta para Intelbras iMHDX
         """
-        # Formato padrão para Intelbras: rtsp://user:pass@host:port/stream
-        url = f"rtsp://{self.dvr_user}:{self.dvr_pass}@{self.dvr_host}:554/stream{self.camera_index}"
+        # URL RTSP correta para Intelbras: rtsp://user:pass@host/cam/realmonitor?channel=X&subtype=0
+        url = f"rtsp://{self.dvr_user}:{self.dvr_pass}@{self.dvr_host}/cam/realmonitor?channel={self.camera_index}&subtype=0"
         logger.info(f"Usando URL de fallback: {url}")
         return url
     
