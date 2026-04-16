@@ -1,20 +1,16 @@
-# Use imagem Python 3.11 slim como base (compatível com ultralytics 8.0.x)
+# Use imagem Python 3.11 slim como base
 FROM python:3.11-slim
 
 # Definir diretório de trabalho
 WORKDIR /app
 
-# Instalar dependências do sistema necessárias
+# Instalar dependências do sistema necessárias (removendo pacotes que não existem no Debian Trixie)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     libxext6 \
     libxrender-dev \
     libgomp1 \
     ffmpeg \
-    libopenblas-dev \
-    liblapack-dev \
-    libatlas-base-dev \
-    gfortran \
     && rm -rf /var/lib/apt/lists/*
 
 # Copiar requirements.txt
