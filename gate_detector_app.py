@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Sistema de Detecção de Carros e Abertura Automática de Portão
-Monitora câmera DVR Intelbras via ONVIF e detecta carros com YOLOv8
+Monitora câmera DVR Intelbras Intelbras via ONVIF e detecta carros com YOLOv8
 Aguarda veículo parado por tempo configurável antes de abrir portão
 """
 
@@ -125,49 +125,40 @@ class GateDetectionSystem:
         Returns:
             URL RTSP ou None se falhar
         """
-        from onvif import ONVIFCamera
-        
-        # Portas comuns para ONVIF em DVRs Intelbras
-        portas_onvif = [self.dvr_port, 8899, 8999, 80, 8080]
-        
-        for porta in portas_onvif:
-            try:
-                logger.info(f"Tentando ONVIF na porta {porta}...")
-                
-                # Conectar a DVR com wsdl_dir=None para evitar erro de HTTPS
-                # Usar wsdl_dir=None desabilita cache de WSDL que pode causar problemas
-                mycam = ONVIFCamera(
-                    self.dvr_host,
-                    porta,
-                    self.dvr_user,
-                    self.dvr_pass,
-                    wsdl_dir=None
-                )
-                
-                # Obter perfis de midia
-                media_service = mycam.create_media_service()
-                profiles = media_service.GetProfiles()
-                
-                if not profiles:
-                    logger.debug(f"Nenhum perfil de midia encontrado na porta {porta}")
-                    continue
-                
-                # Usar o perfil correspondente a camera
-                profile = profiles[self.camera_index - 1] if len(profiles) >= self.camera_index else profiles[0]
-                
-                # Obter URL de stream
-                stream_uri = media_service.GetStreamUri({'ProfileToken': profile.token})
-                stream_url = stream_uri.Uri
-                
-                logger.info(f"URL de stream obtida via ONVIF (porta {porta}): {stream_url}")
-                return stream_url
-                
-            except Exception as e:
-                logger.debug(f"ONVIF falhou na porta {porta}: {str(e)[:100]}")
-                continue
-        
-        logger.warning("Nao foi possivel obter stream via ONVIF em nenhuma porta")
-        return None
+        try:
+            logger.info("Conectando à DVR via ONVIF...")
+            from onvif import ONVIFCamera
+            
+            # Conectar à DVR
+            mycam = ONVIFCamera(
+                self.dvr_host,
+                self.dvr_port,
+                self.dvr_user,
+                self.dvr_pass
+            )
+            
+            # Obter perfis de mídia
+            media_service = mycam.create_media_service()
+            profiles = media_service.GetProfiles()
+            
+            if not profiles:
+                logger.error("Nenhum perfil de mídia encontrado")
+                return None
+            
+            # Usar o perfil correspondente à câmera
+            profile = profiles[self.camera_index - 1] if len(profiles) >= self.camera_index else profiles[0]
+            
+            # Obter URL de stream
+            stream_uri = media_service.GetStreamUri({'ProfileToken': profile.token})
+            stream_url = stream_uri.Uri
+            
+            logger.info(f"URL de stream obtida: {stream_url}")
+            return stream_url
+            
+        except Exception as e:
+            logger.error(f"Erro ao obter stream via ONVIF: {e}")
+            logger.debug(traceback.format_exc())
+            return None
     
     def get_stream_url_fallback(self) -> str:
         """
@@ -669,11 +660,11 @@ def main():
     
     # Obter configurações das variáveis de ambiente
     dvr_host = os.getenv('DVR_HOST')
-    dvr_port = int(os.getenv('DVR_PORT', '80'))
+    dvr_port = int(os.getenv('DVR_PORT'))
     dvr_user = os.getenv('DVR_USER')
     dvr_pass = os.getenv('DVR_PASS')
     camera_index = int(os.getenv('CAMERA_INDEX', '2'))
-    gate_api_url = os.getenv('GATE_API_URL')
+    gate_api_url = os.getenv('GATE_API_URL', 'http://api-v2.pemill.com.br/open/dor/2')
     gate_cooldown_seconds = int(os.getenv('GATE_COOLDOWN_SECONDS', '60'))
     confidence_threshold = float(os.getenv('CONFIDENCE_THRESHOLD', '0.5'))
     rocket_chat_webhook = os.getenv('ROCKET_CHAT_WEBHOOK', None)
