@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Sistema de Detecção de Carros e Abertura Automática de Portão
-Monitora câmera DVR via ONVIF e detecta carros com YOLOv8
+Monitora câmera DVR Intelbras via ONVIF e detecta carros com YOLOv8
 Aguarda veículo parado por tempo configurável antes de abrir portão
 """
 
@@ -119,45 +119,55 @@ class GateDetectionSystem:
     
     def get_stream_url_from_onvif(self) -> Optional[str]:
         """
-        Obtém a URL de stream RTSP da câmera via ONVIF
+        Obtem a URL de stream RTSP da camera via ONVIF
+        Tenta multiplas portas comuns em DVRs Intelbras
         
         Returns:
             URL RTSP ou None se falhar
         """
-        try:
-            logger.info("Conectando à DVR via ONVIF...")
-            from onvif import ONVIFCamera
-            
-            # Conectar à DVR
-            mycam = ONVIFCamera(
-                self.dvr_host,
-                self.dvr_port,
-                self.dvr_user,
-                self.dvr_pass
-            )
-            
-            # Obter perfis de mídia
-            media_service = mycam.create_media_service()
-            profiles = media_service.GetProfiles()
-            
-            if not profiles:
-                logger.error("Nenhum perfil de mídia encontrado")
-                return None
-            
-            # Usar o perfil correspondente à câmera
-            profile = profiles[self.camera_index - 1] if len(profiles) >= self.camera_index else profiles[0]
-            
-            # Obter URL de stream
-            stream_uri = media_service.GetStreamUri({'ProfileToken': profile.token})
-            stream_url = stream_uri.Uri
-            
-            logger.info(f"URL de stream obtida: {stream_url}")
-            return stream_url
-            
-        except Exception as e:
-            logger.error(f"Erro ao obter stream via ONVIF: {e}")
-            logger.debug(traceback.format_exc())
-            return None
+        from onvif import ONVIFCamera
+        
+        # Portas comuns para ONVIF em DVRs Intelbras
+        portas_onvif = [self.dvr_port, 8899, 8999, 80, 8080]
+        
+        for porta in portas_onvif:
+            try:
+                logger.info(f"Tentando ONVIF na porta {porta}...")
+                
+                # Conectar a DVR com wsdl_dir=None para evitar erro de HTTPS
+                # Usar wsdl_dir=None desabilita cache de WSDL que pode causar problemas
+                mycam = ONVIFCamera(
+                    self.dvr_host,
+                    porta,
+                    self.dvr_user,
+                    self.dvr_pass,
+                    wsdl_dir=None
+                )
+                
+                # Obter perfis de midia
+                media_service = mycam.create_media_service()
+                profiles = media_service.GetProfiles()
+                
+                if not profiles:
+                    logger.debug(f"Nenhum perfil de midia encontrado na porta {porta}")
+                    continue
+                
+                # Usar o perfil correspondente a camera
+                profile = profiles[self.camera_index - 1] if len(profiles) >= self.camera_index else profiles[0]
+                
+                # Obter URL de stream
+                stream_uri = media_service.GetStreamUri({'ProfileToken': profile.token})
+                stream_url = stream_uri.Uri
+                
+                logger.info(f"URL de stream obtida via ONVIF (porta {porta}): {stream_url}")
+                return stream_url
+                
+            except Exception as e:
+                logger.debug(f"ONVIF falhou na porta {porta}: {str(e)[:100]}")
+                continue
+        
+        logger.warning("Nao foi possivel obter stream via ONVIF em nenhuma porta")
+        return None
     
     def get_stream_url_fallback(self) -> str:
         """
@@ -302,7 +312,62 @@ class GateDetectionSystem:
             logger.debug(traceback.format_exc())
             return False
     
-    def send_rocket_chat_notification(self, frame: np.ndarray) -> bool:
+    def draw_detections_on_frame(self, frame: np.ndarray, detections: List) -> np.ndarray:
+        """
+        Desenha bounding boxes e informacoes das deteccoes no frame
+        
+        Args:
+            frame: Frame original
+            detections: Lista de deteccoes com box e confidence
+            
+        Returns:
+            Frame com bounding boxes desenhados
+        """
+        frame_copy = frame.copy()
+        
+        for detection in detections:
+            box = detection['box']
+            confidence = detection['confidence']
+            class_name = detection['class']
+            
+            # Coordenadas do retangulo
+            x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+            
+            # Desenhar retangulo verde
+            cv2.rectangle(frame_copy, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            
+            # Texto com label e confianca
+            label = f"{class_name} {confidence:.1%}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.6
+            thickness = 2
+            
+            # Obter tamanho do texto
+            text_size = cv2.getTextSize(label, font, font_scale, thickness)[0]
+            
+            # Desenhar fundo para o texto
+            cv2.rectangle(
+                frame_copy,
+                (x1, y1 - text_size[1] - 5),
+                (x1 + text_size[0] + 5, y1),
+                (0, 255, 0),
+                -1
+            )
+            
+            # Desenhar texto
+            cv2.putText(
+                frame_copy,
+                label,
+                (x1 + 2, y1 - 5),
+                font,
+                font_scale,
+                (0, 0, 0),
+                thickness
+            )
+        
+        return frame_copy
+    
+    def send_rocket_chat_notification(self, frame: np.ndarray, detections: List) -> bool:
         """
         Envia notificação com screenshot para Rocket.Chat
         
@@ -316,8 +381,11 @@ class GateDetectionSystem:
             return False
         
         try:
+            # Desenhar detecções no frame
+            frame_with_detections = self.draw_detections_on_frame(frame, detections)
+            
             # Codificar frame em PNG
-            success, buffer = cv2.imencode('.png', frame)
+            success, buffer = cv2.imencode('.png', frame_with_detections)
             if not success:
                 logger.error("Falha ao codificar frame em PNG")
                 return False
@@ -476,7 +544,7 @@ class GateDetectionSystem:
                                 
                                 # Enviar notificação para Rocket.Chat com screenshot
                                 if self.last_frame is not None:
-                                    self.send_rocket_chat_notification(self.last_frame)
+                                    self.send_rocket_chat_notification(self.last_frame, detections)
                                 
                                 # Resetar rastreamento
                                 self.car_detection_start_time = None
@@ -601,7 +669,7 @@ def main():
     
     # Obter configurações das variáveis de ambiente
     dvr_host = os.getenv('DVR_HOST')
-    dvr_port = int(os.getenv('DVR_PORT'))
+    dvr_port = int(os.getenv('DVR_PORT', '80'))
     dvr_user = os.getenv('DVR_USER')
     dvr_pass = os.getenv('DVR_PASS')
     camera_index = int(os.getenv('CAMERA_INDEX', '2'))
